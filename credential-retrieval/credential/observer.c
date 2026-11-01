@@ -65,9 +65,16 @@ static kern_return_t replace_debug_state(thread_t thread, const arm_debug_state6
     arm_debug_state64_t cleared = {0};
     kern_return_t status = thread_set_state(thread, ARM_DEBUG_STATE64, (thread_state_t)&cleared, ARM_DEBUG_STATE64_COUNT);
     if (status != KERN_SUCCESS) {
+        fprintf(stderr, "thread_set_state(clear) thread=%u status=%#x\n",
+                (unsigned int)thread, (unsigned int)status);
         return status;
     }
-    return thread_set_state(thread, ARM_DEBUG_STATE64, (thread_state_t)desired, ARM_DEBUG_STATE64_COUNT);
+    status = thread_set_state(thread, ARM_DEBUG_STATE64, (thread_state_t)desired, ARM_DEBUG_STATE64_COUNT);
+    if (status != KERN_SUCCESS) {
+        fprintf(stderr, "thread_set_state(install) thread=%u status=%#x\n",
+                (unsigned int)thread, (unsigned int)status);
+    }
+    return status;
 }
 
 static int set_breakpoints(ThreadWatch *watch, uint64_t call_address, uint64_t return_address) {
@@ -405,6 +412,8 @@ static int credential_transform_address(task_t task, uint64_t base, uint64_t *ad
 static int observe_fairplay(pid_t pid, uint32_t selector, SelectorReturnCallback callback, EntryCallback entry_callback, void *context, unsigned seconds) {
     Observer *observer = calloc(1, sizeof(*observer));
     if (!observer || seconds == 0 || (entry_callback ? callback != NULL : (!callback || (selector != 9 && selector != 21)))) {
+        fprintf(stderr, "observer initialization failed: allocation=%s, seconds=%u, selector=%u, entry_mode=%d\n",
+                observer ? "ok" : "failed", seconds, selector, entry_callback != NULL);
         free(observer);
         return -1;
     }
@@ -454,18 +463,34 @@ static int observe_fairplay(pid_t pid, uint32_t selector, SelectorReturnCallback
                 observer->task, (unsigned long long)observer->call_address);
     }
 
-    if (mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &observer->exception_port) != KERN_SUCCESS || mach_port_insert_right(mach_task_self(), observer->exception_port, observer->exception_port, MACH_MSG_TYPE_MAKE_SEND) != KERN_SUCCESS) {
+    status = mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &observer->exception_port);
+    fprintf(stderr, "mach_port_allocate status=%#x, exception_port=%#x\n",
+            (unsigned int)status, (unsigned int)observer->exception_port);
+    if (status != KERN_SUCCESS) {
         goto end;
     }
 
-    if (task_suspend(observer->task) != KERN_SUCCESS) {
+    status = mach_port_insert_right(mach_task_self(), observer->exception_port, observer->exception_port, MACH_MSG_TYPE_MAKE_SEND);
+    fprintf(stderr, "mach_port_insert_right status=%#x\n", (unsigned int)status);
+    if (status != KERN_SUCCESS) {
+        goto end;
+    }
+
+    status = task_suspend(observer->task);
+    fprintf(stderr, "task_suspend status=%#x\n", (unsigned int)status);
+    if (status != KERN_SUCCESS) {
         goto end;
     }
 
     thread_act_array_t threads = NULL;
     mach_msg_type_number_t count = 0;
     status = task_threads(observer->task, &threads, &count);
+    fprintf(stderr, "task_threads status=%#x, count=%u, limit=%u\n",
+            (unsigned int)status, (unsigned int)count, (unsigned int)MAX_THREADS);
     if (status != KERN_SUCCESS || count > MAX_THREADS) {
+        if (count > MAX_THREADS) {
+            fprintf(stderr, "task_threads count exceeds observer capacity\n");
+        }
         if (threads) {
             vm_deallocate(mach_task_self(), (vm_address_t)(uintptr_t)threads, count * sizeof(thread_t));
         }
