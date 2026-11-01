@@ -1,0 +1,28 @@
+name: Build Taurine aligned-only FoulDecrypt
+on:
+  push:
+    branches: [fouldecrypt-taurine-aligned]
+    paths:
+      - 'tools/fouldecrypt/**'
+      - '.github/workflows/fouldecrypt-taurine.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test independent output verifier
+        run: python3 -m unittest discover -s tools/fouldecrypt -p 'test_*.py' -v
+      - name: Install signing tool
+        run: brew install ldid
+      - name: Build without executing device code
+        run: bash tools/fouldecrypt/build.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fouldecrypt-taurine-aligned
+          path: artifact/
+          if-no-files-found: error
+          retention-days: 14
