@@ -1305,9 +1305,25 @@ end:
     return status;
 }
 
+
+static int run_diagnose_task(int argc, char **argv) {
+    if (argc != 3) {
+        return 2;
+    }
+    char *end = NULL;
+    errno = 0;
+    long pid = strtol(argv[2], &end, 10);
+    if (errno || end == argv[2] || *end || pid <= 0 || pid > INT_MAX) {
+        return 2;
+    }
+    return diagnose_fairplay_task((pid_t)pid);
+}
+
 int main(int argc, char **argv) {
     int status = -1;
-    if (argc >= 2 && !strcmp(argv[1], "retrieve")) {
+    if (argc >= 2 && !strcmp(argv[1], "diagnose-task")) {
+        status = run_diagnose_task(argc, argv);
+    } else if (argc >= 2 && !strcmp(argv[1], "retrieve")) {
         status = run_retrieve(argc, argv);
     } else if (argc >= 2 && !strcmp(argv[1], "device-udid")) {
         status = run_device_udid(argc, argv);
@@ -1317,13 +1333,14 @@ int main(int argc, char **argv) {
         status = run_observe_credential(argc, argv);
     }
 
-    if (status && (argc < 2 || (strcmp(argv[1], "retrieve") && strcmp(argv[1], "device-udid") && strcmp(argv[1], "observe-uid-layer") && strcmp(argv[1], "observe-credential")) || status == 2)) {
+    if (status && (argc < 2 || (strcmp(argv[1], "retrieve") && strcmp(argv[1], "device-udid") && strcmp(argv[1], "observe-uid-layer") && strcmp(argv[1], "observe-credential") && strcmp(argv[1], "diagnose-task")) || status == 2)) {
         fprintf(stderr,
                 "usage: %s retrieve IPA_OR_SINF UID_LAYER [NEW_CREDENTIAL]\n"
                 "       %s device-udid NEW_FILE\n"
                 "       %s observe-uid-layer PID NEW_UID_LAYER [TIMEOUT_SECONDS]\n"
-                "       %s observe-credential PID SINF NEW_CREDENTIAL [TIMEOUT_SECONDS]\n",
-                argv[0], argv[0], argv[0], argv[0]);
+                "       %s observe-credential PID SINF NEW_CREDENTIAL [TIMEOUT_SECONDS]\n"
+                "       %s diagnose-task PID\n",
+                argv[0], argv[0], argv[0], argv[0], argv[0]);
         return 2;
     }
 

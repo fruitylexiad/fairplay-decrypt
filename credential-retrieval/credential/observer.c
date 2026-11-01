@@ -1,4 +1,7 @@
 #include "observer.h"
+#include <CoreFoundation/CoreFoundation.h>
+#include <arpa/inet.h>
+#include <errno.h>
 #include <mach/arm/thread_status.h>
 #include <mach/exc.h>
 #include <mach/exception_types.h>
@@ -584,4 +587,157 @@ int observe_fairplay_requests(pid_t pid, uint32_t selector, SelectorReturnCallba
 
 int observe_fairplay_credential(pid_t pid, EntryCallback callback, void *context, unsigned seconds) {
     return observe_fairplay(pid, 0, NULL, callback, context, seconds);
+}
+
+/* Read-only capability probe. Never enter restore_observer(): that routine
+ * suspends the target even when no breakpoint was installed. */
+typedef int (*DiagnosticCSOps)(pid_t, unsigned int, void *, size_t);
+
+static void diagnostic_signature(pid_t pid, const char *label, int entitlements) {
+    DiagnosticCSOps query = (DiagnosticCSOps)dlsym(RTLD_DEFAULT, "csops");
+    if (!query) {
+        fprintf(stderr, "diagnose %s: csops unavailable\n", label);
+        return;
+    }
+    uint32_t flags = 0;
+    errno = 0;
+    int result = query(pid, 0 /* CS_OPS_STATUS */, &flags, sizeof(flags));
+    int error = result ? errno : 0;
+    fprintf(stderr, "diagnose %s csops(status): result=%d errno=%d flags=%#x platform=%d valid=%d get_task_allow=%d\n",
+            label, result, error, (unsigned int)flags,
+            !!(flags & 0x04000000U), !!(flags & 1U), !!(flags & 4U));
+    if (!entitlements) {
+        return;
+    }
+
+    uint32_t header[2] = {0};
+    errno = 0;
+    result = query(pid, 7 /* CS_OPS_ENTITLEMENTS_BLOB */, header, sizeof(header));
+    error = result ? errno : 0;
+    uint32_t length = ntohl(header[1]);
+    fprintf(stderr, "diagnose self csops(entitlement header): result=%d errno=%d bytes=%u\n",
+            result, error, (unsigned int)length);
+    if ((result && error != ERANGE) || ntohl(header[0]) != 0xfade7171U || length <= sizeof(header) || length > 65536) {
+        fprintf(stderr, "diagnose self: kernel-supplied XML entitlements unavailable\n");
+        return;
+    }
+    uint8_t *blob = calloc(1, length);
+    if (!blob) {
+        fprintf(stderr, "diagnose self: entitlement buffer allocation failed\n");
+        return;
+    }
+    errno = 0;
+    result = query(pid, 7, blob, length);
+    error = result ? errno : 0;
+    fprintf(stderr, "diagnose self csops(entitlement blob): result=%d errno=%d\n", result, error);
+    if (!result) {
+        CFDataRef data = CFDataCreate(kCFAllocatorDefault, blob + sizeof(header), (CFIndex)(length - sizeof(header)));
+        CFPropertyListRef plist = data ? CFPropertyListCreateWithData(kCFAllocatorDefault, data, kCFPropertyListImmutable, NULL, NULL) : NULL;
+        if (plist && CFGetTypeID(plist) == CFDictionaryGetTypeID()) {
+            const char *names[] = {"platform-application", "get-task-allow", "task_for_pid-allow", "com.apple.private.thread-set-state", "com.apple.private.security.container-required"};
+            for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+                CFStringRef key = CFStringCreateWithCString(kCFAllocatorDefault, names[i], kCFStringEncodingUTF8);
+                CFTypeRef value = key ? CFDictionaryGetValue((CFDictionaryRef)plist, key) : NULL;
+                const char *text = !value ? "absent" : CFGetTypeID(value) != CFBooleanGetTypeID() ? "non-boolean" : CFBooleanGetValue((CFBooleanRef)value) ? "true" : "false";
+                fprintf(stderr, "diagnose self signature entitlement %s=%s\n", names[i], text);
+                if (key) {
+                    CFRelease(key);
+                }
+            }
+        } else {
+            fprintf(stderr, "diagnose self: entitlement plist could not be decoded\n");
+        }
+        if (plist) {
+            CFRelease(plist);
+        }
+        if (data) {
+            CFRelease(data);
+        }
+    }
+    free(blob);
+}
+
+int diagnose_fairplay_task(pid_t pid) {
+    fprintf(stderr, "diagnose-task: read-only; no suspension, breakpoints, exception changes or credential output\n");
+    fprintf(stderr, "diagnose self uid=%u euid=%u target_pid=%d\n",
+            (unsigned int)getuid(), (unsigned int)geteuid(), pid);
+    diagnostic_signature(getpid(), "self", 1);
+    diagnostic_signature(pid, "target", 0);
+
+    task_t task = MACH_PORT_NULL;
+    kern_return_t status = task_for_pid(mach_task_self(), pid, &task);
+    fprintf(stderr, "diagnose task_for_pid status=%#x port=%#x\n", (unsigned int)status, (unsigned int)task);
+    if (status != KERN_SUCCESS || task == MACH_PORT_NULL) {
+        return 1;
+    }
+
+    mach_port_type_t type = 0;
+    status = mach_port_type(mach_task_self(), task, &type);
+    fprintf(stderr, "diagnose mach_port_type status=%#x send=%d dead_name=%d\n",
+            (unsigned int)status, !!(type & MACH_PORT_TYPE_SEND), !!(type & MACH_PORT_TYPE_DEAD_NAME));
+    mach_port_urefs_t refs = 0;
+    status = mach_port_get_refs(mach_task_self(), task, MACH_PORT_RIGHT_SEND, &refs);
+    fprintf(stderr, "diagnose send refs status=%#x refs=%u (send right alone does not establish task flavor)\n",
+            (unsigned int)status, (unsigned int)refs);
+    int actual_pid = -1;
+    status = pid_for_task(task, &actual_pid);
+    fprintf(stderr, "diagnose pid_for_task status=%#x pid=%d matches=%d\n",
+            (unsigned int)status, actual_pid, actual_pid == pid);
+    if (status == KERN_SUCCESS && actual_pid != pid) {
+        mach_port_deallocate(mach_task_self(), task);
+        return 1;
+    }
+
+    task_basic_info_64_data_t basic = {0};
+    mach_msg_type_number_t count = TASK_BASIC_INFO_64_COUNT;
+    status = task_info(task, TASK_BASIC_INFO_64, (task_info_t)&basic, &count);
+    fprintf(stderr, "diagnose task_info(basic) status=%#x\n", (unsigned int)status);
+
+    task_dyld_info_data_t dyld = {0};
+    count = TASK_DYLD_INFO_COUNT;
+    status = task_info(task, TASK_DYLD_INFO, (task_info_t)&dyld, &count);
+    fprintf(stderr, "diagnose task_info(dyld) status=%#x\n", (unsigned int)status);
+    if (status == KERN_SUCCESS && dyld.all_image_info_addr) {
+        uint32_t scratch = 0;
+        vm_size_t got = 0;
+        status = vm_read_overwrite(task, (vm_address_t)dyld.all_image_info_addr, sizeof(scratch), (vm_address_t)(uintptr_t)&scratch, &got);
+        fprintf(stderr, "diagnose vm_read_overwrite(dyld metadata, 4 bytes) status=%#x bytes=%llu (contents omitted)\n",
+                (unsigned int)status, (unsigned long long)got);
+    }
+
+    thread_act_array_t threads = NULL;
+    count = 0;
+    status = task_threads(task, &threads, &count);
+    fprintf(stderr, "diagnose task_threads status=%#x count=%u\n", (unsigned int)status, (unsigned int)count);
+    if (status == KERN_SUCCESS && count) {
+        arm_debug_state64_t debug = {0};
+        mach_msg_type_number_t debug_count = ARM_DEBUG_STATE64_COUNT;
+        kern_return_t debug_status = thread_get_state(threads[0], ARM_DEBUG_STATE64, (thread_state_t)&debug, &debug_count);
+        fprintf(stderr, "diagnose first thread_get_state(debug) status=%#x (register contents omitted)\n",
+                (unsigned int)debug_status);
+    }
+    if (threads) {
+        for (mach_msg_type_number_t i = 0; i < count; i++) {
+            mach_port_deallocate(mach_task_self(), threads[i]);
+        }
+        vm_deallocate(mach_task_self(), (vm_address_t)(uintptr_t)threads, count * sizeof(thread_t));
+    }
+
+    exception_mask_t masks[EXC_TYPES_COUNT];
+    mach_port_t handlers[EXC_TYPES_COUNT];
+    exception_behavior_t behaviors[EXC_TYPES_COUNT];
+    thread_state_flavor_t flavors[EXC_TYPES_COUNT];
+    count = EXC_TYPES_COUNT;
+    status = task_get_exception_ports(task, EXC_MASK_BREAKPOINT, masks, &count, handlers, behaviors, flavors);
+    fprintf(stderr, "diagnose task_get_exception_ports(read-only control-interface probe) status=%#x\n", (unsigned int)status);
+    if (status == KERN_SUCCESS) {
+        for (mach_msg_type_number_t i = 0; i < count; i++) {
+            if (handlers[i] != MACH_PORT_NULL) {
+                mach_port_deallocate(mach_task_self(), handlers[i]);
+            }
+        }
+    }
+    mach_port_deallocate(mach_task_self(), task);
+    fprintf(stderr, "diagnose-task complete; exit 0 means probe completed, not extraction capability\n");
+    return 0;
 }
