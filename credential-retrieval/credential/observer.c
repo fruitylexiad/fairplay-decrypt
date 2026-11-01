@@ -431,13 +431,27 @@ static int observe_fairplay(pid_t pid, uint32_t selector, SelectorReturnCallback
         }
     } else {
         void *symbol = dlsym(RTLD_DEFAULT, "IOConnectCallStructMethod");
-        uint8_t remote[16];
-        if (!symbol || read_remote(observer->task, (uint64_t)(uintptr_t)symbol, remote, sizeof(remote)) || memcmp(remote, symbol, sizeof(remote))) {
-            fprintf(stderr, "IOKit function is not mapped at the same address in fairplayd\n");
+        if (!symbol) {
+            fprintf(stderr, "IOConnectCallStructMethod not found locally\n");
             goto end;
         }
 
+        uint8_t remote[16];
+        if (read_remote(observer->task, (uint64_t)(uintptr_t)symbol, remote, sizeof(remote)) || memcmp(remote, symbol, sizeof(remote))) {
+            /* Issue #22: explicitly opt in to the reported local-address
+             * workaround. This does not resolve a different remote address.
+             * Keep the original validation as the default on other devices. */
+            const char *allow_local = getenv("FAIRPLAY_ALLOW_LOCAL_IOKIT");
+            if (!allow_local || strcmp(allow_local, "1")) {
+                fprintf(stderr, "IOKit function is not mapped at the same address in fairplayd\n");
+                goto end;
+            }
+            fprintf(stderr, "warning: using unverified local IOKit address (issue #22 workaround)\n");
+        }
+
         observer->call_address = (uint64_t)(uintptr_t)symbol;
+        fprintf(stderr, "task_for_pid port = %#x, call_address = %#llx\n",
+                observer->task, (unsigned long long)observer->call_address);
     }
 
     if (mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &observer->exception_port) != KERN_SUCCESS || mach_port_insert_right(mach_task_self(), observer->exception_port, observer->exception_port, MACH_MSG_TYPE_MAKE_SEND) != KERN_SUCCESS) {
